@@ -1,3 +1,9 @@
+[![GitHub Downloads](https://img.shields.io/github/downloads/ScriptedBits/FTP-testing/total?style=for-the-badge&color=blue)](https://github.com/ScriptedBits/FTP-testing/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207+-blue.svg?style=for-the-badge)](https://github.com/PowerShell/PowerShell)
+
+A PowerShell tool (Console + GUI) for testing FTP server reliability...
+
 # FTP Load Test Script
 
 A PowerShell tool designed to thoroughly test FTP server reliability — especially useful for diagnosing intermittent **Scan to FTP** / **Scan to Folder** failures on printers (Kyocera, Ricoh, HP, Xerox, etc.).
