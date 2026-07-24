@@ -5,8 +5,8 @@
 
 
 #------------------------------------------------------------------------------------------------
-# For automated testing create a ftpconfig.ini file in the same directory as the ftptest.ps1 file
-#  
+# For automated testing create a ftpconfig.ini file in the same directory as the ftptest.ps1 file.
+# If you run the script with no ftpconfig.ini found the script can create one for you.
 # Setup up the ftpconfig.ini file with these settings
 # Supports logging when Log=True in ftpconfig.ini
 
@@ -21,12 +21,11 @@
 # Retries=1
 # IntegrityCheck=False
 # Log=True
-
 #------------------------------------------------------------------------------------------------
 
 param()
 
-$ScriptVersion = "1.7"
+$ScriptVersion = "1.10"
 $ErrorActionPreference = "Stop"
 
 Write-Host "FTP Load Test Script  v$ScriptVersion" -ForegroundColor Cyan
@@ -52,6 +51,42 @@ function Read-Ini {
         }
     }
     return $ini
+}
+
+function Save-Ini {
+    param(
+        [string]$Path,
+        [string]$Server,
+        [string]$RemotePath,
+        [string]$Username,
+        [string]$Password,
+        [int]$Loops,
+        [int]$Delay,
+        [string]$Mode,
+        [int]$Retries,
+        [bool]$IntegrityCheck,
+        [bool]$LogEnabled
+    )
+
+    $content = @"
+; FTP Testing Script v$ScriptVersion
+; Generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+[FTP]
+Server=$Server
+Path=$RemotePath
+Username=$Username
+Password=$Password
+Loops=$Loops
+Delay=$Delay
+Mode=$Mode
+Retries=$Retries
+IntegrityCheck=$($IntegrityCheck.ToString())
+Log=$($LogEnabled.ToString())
+"@
+
+    $content | Out-File -FilePath $Path -Encoding UTF8
+    Write-Host "Settings saved to: $Path" -ForegroundColor Green
 }
 
 $server          = $null
@@ -98,6 +133,14 @@ else {
     $integrityCheck = -not ($intAns -match "^[Nn]")
     $logAns = Read-Host "Enable logging to text file? (Y/N)"
     $logEnabled = ($logAns -match "^[Yy]")
+
+    Write-Host ""
+    $saveAns = Read-Host "Do you want to save these settings to ftpconfig.ini for next time? (Y/N)"
+    if ($saveAns -match "^[Yy]") {
+        $pathForIni = if ([string]::IsNullOrWhiteSpace($path)) { "/" } else { $path }
+        Save-Ini -Path $configFile -Server $server -RemotePath $pathForIni -Username $user -Password $pass `
+                 -Loops $loops -Delay $delay -Mode $mode -Retries $retries -IntegrityCheck $integrityCheck -LogEnabled $logEnabled
+    }
 }
 
 # Normalize path
@@ -120,6 +163,81 @@ Write-Host "  Logging         : $logEnabled"
 Write-Host ""
 
 # -------------------------------------------------
+# Helper Functions
+# -------------------------------------------------
+function New-FtpRequest {
+    param([string]$Uri, [string]$Method, [string]$Username, [string]$Password, [bool]$UsePassive)
+    $req = [System.Net.FtpWebRequest]::Create($Uri)
+    $req.Credentials = New-Object System.Net.NetworkCredential($Username, $Password)
+    $req.Method = $Method
+    $req.UseBinary = $true
+    $req.UsePassive = $UsePassive
+    $req.KeepAlive = $false
+    $req.Timeout = 15000
+    return $req
+}
+
+function Invoke-FtpCommand {
+    param(
+        $Server, $RemotePath, $Method,
+        $LocalFile = $null, $DownloadTo = $null,
+        $Username, $Password, $UsePassive
+    )
+
+    $uri = if ($LocalFile -or $DownloadTo) {
+        $fileName = if ($LocalFile) { Split-Path $LocalFile -Leaf } else { Split-Path $DownloadTo -Leaf }
+        "ftp://$Server$RemotePath/$fileName"
+    } else {
+        "ftp://$Server$RemotePath"
+    }
+
+    try {
+        $req = New-FtpRequest -Uri $uri -Method $Method -Username $Username -Password $Password -UsePassive $UsePassive
+
+        if ($LocalFile -and $Method -eq [System.Net.WebRequestMethods+Ftp]::UploadFile) {
+            $fileContent = [System.IO.File]::ReadAllBytes($LocalFile)
+            $req.ContentLength = $fileContent.Length
+            $stream = $req.GetRequestStream()
+            $stream.Write($fileContent, 0, $fileContent.Length)
+            $stream.Close()
+        }
+
+        $resp = $req.GetResponse()
+
+        if ($DownloadTo -and $Method -eq [System.Net.WebRequestMethods+Ftp]::DownloadFile) {
+            $responseStream = $resp.GetResponseStream()
+            $fileStream = [System.IO.File]::Create($DownloadTo)
+            $responseStream.CopyTo($fileStream)
+            $fileStream.Close()
+            $responseStream.Close()
+        }
+
+        $status = "$($resp.StatusCode) - $($resp.StatusDescription)".Trim()
+        $resp.Close()
+        return @{ Success = $true; Message = $status }
+    }
+    catch [System.Net.WebException] {
+        $msg = $_.Exception.Message
+
+        if ($_.Exception.Response -ne $null) {
+            try {
+                $ftpResp = [System.Net.FtpWebResponse]$_.Exception.Response
+                $code = $ftpResp.StatusCode
+                $desc = if ($ftpResp.StatusDescription) { $ftpResp.StatusDescription.Trim() } else { "" }
+                $msg = "$code - $desc".Trim(" -")
+                $ftpResp.Close()
+            }
+            catch { }
+        }
+
+        return @{ Success = $false; Message = $msg }
+    }
+    catch {
+        return @{ Success = $false; Message = $_.Exception.Message }
+    }
+}
+
+# -------------------------------------------------
 # DNS Reliability Check
 # -------------------------------------------------
 Write-Host "Running DNS Reliability Check (10 lookups)..." -ForegroundColor Cyan
@@ -129,17 +247,22 @@ $dnsFail    = 0
 $dnsResults = @()
 
 for ($d = 1; $d -le 10; $d++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $result = [System.Net.Dns]::GetHostAddresses($server)
+        $sw.Stop()
         $ipList = ($result | ForEach-Object { $_.IPAddressToString }) -join ", "
-        Write-Host "  Lookup $d : OK → $ipList" -ForegroundColor Green
+        $ms = $sw.ElapsedMilliseconds
+        Write-Host "  Lookup $d : OK ($ms`ms) → $ipList" -ForegroundColor Green
         $dnsSuccess++
-        $dnsResults += "Lookup $d : OK → $ipList"
+        $dnsResults += "Lookup $d : OK ($ms`ms) → $ipList"
     }
     catch {
-        Write-Host "  Lookup $d : FAILED → $($_.Exception.Message)" -ForegroundColor Red
+        $sw.Stop()
+        $ms = $sw.ElapsedMilliseconds
+        Write-Host "  Lookup $d : FAILED ($ms`ms) → $($_.Exception.Message)" -ForegroundColor Red
         $dnsFail++
-        $dnsResults += "Lookup $d : FAILED → $($_.Exception.Message)"
+        $dnsResults += "Lookup $d : FAILED ($ms`ms) → $($_.Exception.Message)"
     }
     Start-Sleep -Milliseconds 200
 }
@@ -150,10 +273,61 @@ Write-Host "DNS Results: $dnsSuccess successful / $dnsFail failed" -ForegroundCo
 if ($dnsFail -gt 1) {
     Write-Host ""
     Write-Host "WARNING: DNS resolution is unreliable!" -ForegroundColor Red
-    Write-Host "This is very likely the cause of intermittent FTP failures." -ForegroundColor Red
+    Write-Host "This is very likely the cause of intermittent scan failures." -ForegroundColor Red
     Write-Host "Strongly recommended: Use the IP address instead of the hostname/FQDN." -ForegroundColor Yellow
     Write-Host ""
 }
+
+# -------------------------------------------------
+# Initial FTP Connection Test
+# -------------------------------------------------
+Write-Host "Testing initial FTP connection..." -ForegroundColor Cyan
+
+$initialTest = Invoke-FtpCommand -Server $server -RemotePath $path `
+                                 -Method ([System.Net.WebRequestMethods+Ftp]::ListDirectory) `
+                                 -Username $user -Password $pass -UsePassive $usePassive
+
+if (-not $initialTest.Success) {
+    Write-Host ""
+    Write-Host "=======================================================" -ForegroundColor Red
+    Write-Host "  ERROR: Cannot connect to the FTP server!" -ForegroundColor Red
+    Write-Host "=======================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Server   : $server" -ForegroundColor Yellow
+    Write-Host "Path     : $($path -replace '^$','/')" -ForegroundColor Yellow
+
+    # Force a clear message
+    $errorDetails = $initialTest.Message
+    if ([string]::IsNullOrWhiteSpace($errorDetails) -or $errorDetails -eq "Undefined") {
+        $errorDetails = "Unable to connect to the FTP server (connection failed)"
+    }
+
+    Write-Host "Details  : $errorDetails" -ForegroundColor Red
+    Write-Host ""
+
+    if ($dnsFail -eq 10) {
+        Write-Host "IMPORTANT: All 10 DNS lookups failed!" -ForegroundColor Red
+        Write-Host "The hostname '$server' cannot be resolved." -ForegroundColor Red
+        Write-Host "Please change the Server value in ftpconfig.ini to the IP address instead of the hostname." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Possible causes:" -ForegroundColor Yellow
+        Write-Host "  - Wrong IP address / hostname"
+        Write-Host "  - Wrong username or password"
+        Write-Host "  - Wrong path"
+        Write-Host "  - FTP service not running"
+        Write-Host "  - Firewall blocking the connection"
+        Write-Host "  - Passive mode / port issues"
+    }
+
+    Write-Host ""
+    Write-Host "Script stopped. No further tests will be run." -ForegroundColor Red
+    Write-Host ""
+    exit 1
+}
+
+Write-Host "Initial FTP connection successful!" -ForegroundColor Green
+Write-Host ""
 
 # -------------------------------------------------
 # Logging setup
@@ -182,6 +356,9 @@ if ($logEnabled) {
     $logLines += "Successful : $dnsSuccess"
     $logLines += "Failed     : $dnsFail"
     $dnsResults | ForEach-Object { $logLines += "  $_" }
+    $logLines += ""
+    $logLines += "----- Initial Connection Test -----"
+    $logLines += "Result: SUCCESS"
     $logLines += ""
     $logLines += "----- Test Results -----"
     $logLines += ""
@@ -212,83 +389,6 @@ foreach ($s in $sizes) {
 Write-Host ""
 
 # -------------------------------------------------
-# Helper functions
-# -------------------------------------------------
-function Get-FileHashSHA256 {
-    param([string]$FilePath)
-    return (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash
-}
-
-function New-FtpRequest {
-    param(
-        [string]$Uri,
-        [string]$Method,
-        [string]$Username,
-        [string]$Password,
-        [bool]$UsePassive
-    )
-    $req = [System.Net.FtpWebRequest]::Create($Uri)
-    $req.Credentials = New-Object System.Net.NetworkCredential($Username, $Password)
-    $req.Method = $Method
-    $req.UseBinary = $true
-    $req.UsePassive = $UsePassive
-    $req.KeepAlive = $false
-    $req.Timeout = 20000
-    return $req
-}
-
-function Invoke-FtpCommand {
-    param(
-        $Server, $RemotePath, $Method,
-        $LocalFile = $null,
-        $DownloadTo = $null,
-        $Username, $Password, $UsePassive
-    )
-
-    $uri = if ($LocalFile -or $DownloadTo) {
-        $fileName = if ($LocalFile) { Split-Path $LocalFile -Leaf } else { Split-Path $DownloadTo -Leaf }
-        "ftp://$Server$RemotePath/$fileName"
-    } else {
-        "ftp://$Server$RemotePath"
-    }
-
-    $req = New-FtpRequest -Uri $uri -Method $Method -Username $Username -Password $Password -UsePassive $UsePassive
-
-    try {
-        if ($LocalFile -and $Method -eq [System.Net.WebRequestMethods+Ftp]::UploadFile) {
-            $fileContent = [System.IO.File]::ReadAllBytes($LocalFile)
-            $req.ContentLength = $fileContent.Length
-            $stream = $req.GetRequestStream()
-            $stream.Write($fileContent, 0, $fileContent.Length)
-            $stream.Close()
-        }
-
-        $resp = $req.GetResponse()
-
-        if ($DownloadTo -and $Method -eq [System.Net.WebRequestMethods+Ftp]::DownloadFile) {
-            $responseStream = $resp.GetResponseStream()
-            $fileStream = [System.IO.File]::Create($DownloadTo)
-            $responseStream.CopyTo($fileStream)
-            $fileStream.Close()
-            $responseStream.Close()
-        }
-
-        $status = "$($resp.StatusCode) - $($resp.StatusDescription.Trim())"
-        $resp.Close()
-        return @{ Success = $true; Message = $status }
-    }
-    catch [System.Net.WebException] {
-        if ($_.Exception.Response) {
-            $ftpResp = [System.Net.FtpWebResponse]$_.Exception.Response
-            $status = "$($ftpResp.StatusCode) - $($ftpResp.StatusDescription.Trim())"
-            $ftpResp.Close()
-            return @{ Success = $false; Message = $status }
-        }
-        return @{ Success = $false; Message = $_.Exception.Message }
-    }
-}
-
-# -------------------------------------------------
 # Main test loop
 # -------------------------------------------------
 $success = 0
@@ -303,13 +403,12 @@ for ($i = 1; $i -le $loops; $i++) {
 
     $fileToUpload = $testFiles[($i - 1) % $testFiles.Count]
     $sizeName     = (Split-Path $fileToUpload -Leaf) -replace "test_|\.bin",""
-    $originalHash = Get-FileHashSHA256 -FilePath $fileToUpload
+    $originalHash = (Get-FileHash -Path $fileToUpload -Algorithm SHA256).Hash
 
     $percent = [math]::Round(($i / $loops) * 100)
     Write-Progress -Activity "FTP Load Test v$ScriptVersion" `
-                   -Status "Test $i of $loops  |  $sizeName  |  OK: $success  Fail: $failed" `
-                   -PercentComplete $percent `
-                   -CurrentOperation "Login → Upload → Integrity Check"
+                   -Status "Test $i of $loops | $sizeName | OK: $success Fail: $failed" `
+                   -PercentComplete $percent
 
     $attempt = 0
     $testSuccess = $false
@@ -324,7 +423,6 @@ for ($i = 1; $i -le $loops; $i++) {
 
         Write-Host "[$i/$loops] $sizeName$attemptInfo ... " -NoNewline
 
-        # ----- 1. Login + CWD -----
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $loginResult = Invoke-FtpCommand -Server $server -RemotePath $path `
                                          -Method ([System.Net.WebRequestMethods+Ftp]::ListDirectory) `
@@ -338,7 +436,6 @@ for ($i = 1; $i -le $loops; $i++) {
             continue
         }
 
-        # ----- 2. Upload -----
         $sw.Restart()
         $uploadResult = Invoke-FtpCommand -Server $server -RemotePath $path `
                                           -Method ([System.Net.WebRequestMethods+Ftp]::UploadFile) `
@@ -353,7 +450,6 @@ for ($i = 1; $i -le $loops; $i++) {
             continue
         }
 
-        # ----- 3. Integrity check (optional) -----
         if ($integrityCheck) {
             $downloadFile = Join-Path $tempDir "download_check.bin"
             $dlResult = Invoke-FtpCommand -Server $server -RemotePath $path `
@@ -362,7 +458,7 @@ for ($i = 1; $i -le $loops; $i++) {
                                           -Username $user -Password $pass -UsePassive $usePassive
 
             if ($dlResult.Success) {
-                $downloadedHash = Get-FileHashSHA256 -FilePath $downloadFile
+                $downloadedHash = (Get-FileHash -Path $downloadFile -Algorithm SHA256).Hash
                 Remove-Item $downloadFile -Force -ErrorAction SilentlyContinue
 
                 if ($downloadedHash -eq $originalHash) {
@@ -373,13 +469,13 @@ for ($i = 1; $i -le $loops; $i++) {
                 }
                 else {
                     $integrity = "FAIL (hash mismatch)"
-                    $finalMessage = "INTEGRITY FAILED (Login ${loginMs}ms / Upload ${uploadMs}ms) → Hash mismatch"
+                    $finalMessage = "INTEGRITY FAILED → Hash mismatch"
                     Write-Host $finalMessage -ForegroundColor Red
                 }
             }
             else {
                 $integrity = "FAIL (download error)"
-                $finalMessage = "INTEGRITY FAILED (Login ${loginMs}ms / Upload ${uploadMs}ms) → Download error: $($dlResult.Message)"
+                $finalMessage = "INTEGRITY FAILED → $($dlResult.Message)"
                 Write-Host $finalMessage -ForegroundColor Red
             }
         }
@@ -391,9 +487,7 @@ for ($i = 1; $i -le $loops; $i++) {
         }
     }
 
-    if ($testSuccess) {
-        $success++
-    }
+    if ($testSuccess) { $success++ }
     else {
         $failed++
         $errors += "[$i] $finalMessage"
@@ -412,7 +506,7 @@ Write-Progress -Activity "FTP Load Test v$ScriptVersion" -Completed
 $duration = (Get-Date) - $startTime
 
 # -------------------------------------------------
-# Cleanup & summary
+# Cleanup & Summary
 # -------------------------------------------------
 Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -427,21 +521,18 @@ if ($errors.Count -gt 0) {
     $errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
 }
 
-# Write log file
 if ($logEnabled) {
     $logLines += ""
     $logLines += "----- Summary -----"
-    $logLines += "Finished        : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    $logLines += "Duration        : $([math]::Round($duration.TotalSeconds,1)) seconds"
-    $logLines += "Successful      : $success"
-    $logLines += "Failed          : $failed"
+    $logLines += "Finished   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $logLines += "Duration   : $([math]::Round($duration.TotalSeconds,1)) seconds"
+    $logLines += "Successful : $success"
+    $logLines += "Failed     : $failed"
     $logLines += ""
-
     if ($errors.Count -gt 0) {
         $logLines += "Error details:"
         $errors | ForEach-Object { $logLines += "  $_" }
     }
-
     $logLines | Out-File -FilePath $logFile -Encoding UTF8
     Write-Host ""
     Write-Host "Log written to: $logFile" -ForegroundColor Cyan
